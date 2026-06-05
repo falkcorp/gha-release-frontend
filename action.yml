@@ -27,7 +27,7 @@ runs:
 
     - name: Build frontend
       continue-on-error: true
-      uses: jdfalk/release-frontend-action@31eb1a0db48e9f428aae8f1b6f0c19beffd3d2e6 # v1.2.0+
+      uses: falkcorp/gha-release-frontend@31eb1a0db48e9f428aae8f1b6f0c19beffd3d2e6 # v1.2.0+
       with:
         node-version: ${{ inputs.node-version }}
         working-directory: ${{ steps.frontend-dir.outputs.dir }}
