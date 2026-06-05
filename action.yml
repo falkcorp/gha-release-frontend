@@ -1,12 +1,76 @@
+# file: action.yml
+# version: 2.0.0
+
 name: 'Frontend Release Build'
-description: 'Build frontend assets for release'
-author: 'jdfalk'
+description: 'Build frontend applications (React, Vue, Angular, etc.) with auto-detection'
+author: 'falkcorp'
+
+branding:
+  icon: 'globe'
+  color: 'purple'
 
 inputs:
+  # --- orchestration inputs (from wrapper) ---
   node-version:
     description: 'Node.js version to use'
     required: false
     default: '22'
+
+  # --- implementation inputs (from base) ---
+  package-manager:
+    description: 'Package manager (npm, yarn, pnpm)'
+    required: false
+    default: 'npm'
+  working-directory:
+    description: >
+      Working directory for the project. Defaults to auto-detect:
+      checks web/, frontend/, then . in that order.
+    required: false
+    default: ''
+  build-command:
+    description: 'Build command'
+    required: false
+    default: 'npm run build'
+  test-command:
+    description: 'Test command'
+    required: false
+    default: 'npm test'
+  lint-command:
+    description: 'Lint command'
+    required: false
+    default: 'npm run lint'
+  run-tests:
+    description: 'Run tests before building'
+    required: false
+    default: 'true'
+  run-lint:
+    description: 'Run linter before building'
+    required: false
+    default: 'true'
+  build-output-dir:
+    description: 'Build output directory (relative to working-directory)'
+    required: false
+    default: 'dist'
+  create-artifact:
+    description: 'Upload build output as a GitHub Actions artifact'
+    required: false
+    default: 'true'
+  artifact-name:
+    description: 'Artifact name'
+    required: false
+    default: 'frontend-build'
+  artifact-retention-days:
+    description: 'Artifact retention days'
+    required: false
+    default: '90'
+
+outputs:
+  build-path:
+    description: 'Path to build output'
+    value: ${{ steps.build-info.outputs.path }}
+  artifact-url:
+    description: 'URL of the uploaded artifact'
+    value: ${{ steps.upload.outputs.artifact-url }}
 
 runs:
   using: 'composite'
@@ -15,7 +79,10 @@ runs:
       id: frontend-dir
       shell: bash
       run: |
-        if [ -f "web/package.json" ]; then
+        # Respect explicit working-directory; otherwise auto-detect
+        if [ -n "${{ inputs.working-directory }}" ]; then
+          echo "dir=${{ inputs.working-directory }}" >> "$GITHUB_OUTPUT"
+        elif [ -f "web/package.json" ]; then
           echo "dir=web" >> "$GITHUB_OUTPUT"
         elif [ -f "frontend/package.json" ]; then
           echo "dir=frontend" >> "$GITHUB_OUTPUT"
@@ -25,12 +92,111 @@ runs:
           echo "dir=." >> "$GITHUB_OUTPUT"
         fi
 
-    - name: Build frontend
-      continue-on-error: true
-      uses: falkcorp/gha-release-frontend@31eb1a0db48e9f428aae8f1b6f0c19beffd3d2e6 # v1.2.0+
+    - name: Detect dependency lock file
+      id: dependency-file
+      shell: bash
+      run: |
+        set -euo pipefail
+        WORKDIR="${{ steps.frontend-dir.outputs.dir }}"
+        MANAGER="${{ inputs.package-manager }}"
+        case "$MANAGER" in
+          npm)
+            CANDIDATES=("${WORKDIR}/package-lock.json" "${WORKDIR}/npm-shrinkwrap.json") ;;
+          yarn)
+            CANDIDATES=("${WORKDIR}/yarn.lock") ;;
+          pnpm)
+            CANDIDATES=("${WORKDIR}/pnpm-lock.yaml") ;;
+          *)
+            echo "::error::Unsupported package manager: ${MANAGER}"; exit 1 ;;
+        esac
+        for file in "${CANDIDATES[@]}"; do
+          if [ -f "$file" ]; then
+            echo "path=$file" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+        done
+        echo "::notice::No dependency lock file found; skipping cache setup."
+        echo "path=" >> "$GITHUB_OUTPUT"
+
+    - name: Set up Node.js (with cache)
+      if: steps.dependency-file.outputs.path != ''
+      uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
       with:
         node-version: ${{ inputs.node-version }}
-        working-directory: ${{ steps.frontend-dir.outputs.dir }}
-        package-manager: npm
-        run-tests: 'true'
-        run-lint: 'true'
+        cache: ${{ inputs.package-manager }}
+        cache-dependency-path: ${{ steps.dependency-file.outputs.path }}
+
+    - name: Set up Node.js (no cache)
+      if: steps.dependency-file.outputs.path == ''
+      uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+      with:
+        node-version: ${{ inputs.node-version }}
+
+    - name: Install dependencies
+      working-directory: ${{ steps.frontend-dir.outputs.dir }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        LOCK_PATH="${{ steps.dependency-file.outputs.path }}"
+        MANAGER="${{ inputs.package-manager }}"
+        if [ "$MANAGER" = "npm" ]; then
+          [ -n "$LOCK_PATH" ] && npm ci || npm install --no-audit --no-fund
+        elif [ "$MANAGER" = "yarn" ]; then
+          [ -n "$LOCK_PATH" ] && yarn install --frozen-lockfile || yarn install --non-interactive
+        elif [ "$MANAGER" = "pnpm" ]; then
+          [ -n "$LOCK_PATH" ] && pnpm install --frozen-lockfile || pnpm install
+        else
+          echo "Unsupported package manager: $MANAGER"; exit 1
+        fi
+
+    - name: Run linter
+      if: inputs.run-lint == 'true'
+      continue-on-error: true
+      working-directory: ${{ steps.frontend-dir.outputs.dir }}
+      shell: bash
+      run: ${{ inputs.lint-command }}
+
+    - name: Run tests
+      if: inputs.run-tests == 'true'
+      continue-on-error: true
+      working-directory: ${{ steps.frontend-dir.outputs.dir }}
+      shell: bash
+      run: ${{ inputs.test-command }}
+
+    - name: Build application (production)
+      working-directory: ${{ steps.frontend-dir.outputs.dir }}
+      shell: bash
+      env:
+        NODE_ENV: production
+      run: ${{ inputs.build-command }}
+
+    - name: Set build info
+      id: build-info
+      shell: bash
+      run: |
+        BUILD_PATH="${{ steps.frontend-dir.outputs.dir }}/${{ inputs.build-output-dir }}"
+        echo "path=$BUILD_PATH" >> $GITHUB_OUTPUT
+
+    - name: Upload build artifact
+      id: upload
+      if: inputs.create-artifact == 'true'
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: ${{ inputs.artifact-name }}
+        path: ${{ steps.build-info.outputs.path }}
+        if-no-files-found: ignore
+        retention-days: ${{ inputs.artifact-retention-days }}
+
+    - name: Output summary
+      shell: bash
+      run: |
+        echo "## Frontend Build Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Node.js:** ${{ inputs.node-version }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Package Manager:** ${{ inputs.package-manager }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Working Directory:** ${{ steps.frontend-dir.outputs.dir }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Build Output:** ${{ steps.build-info.outputs.path }}" >> $GITHUB_STEP_SUMMARY
+        if [ "${{ inputs.create-artifact }}" == "true" ]; then
+          echo "**Artifact:** ${{ inputs.artifact-name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Retention:** ${{ inputs.artifact-retention-days }} days" >> $GITHUB_STEP_SUMMARY
+        fi
